@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,52 +26,62 @@ func fixture() []pkg {
 	}
 }
 
+func set(xs ...string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
+}
+
 func TestSelectTests(t *testing.T) {
 	tests := []struct {
 		name     string
-		seeds    []string
+		expand   map[string]bool
+		testOnly map[string]bool
 		want     []string
 		affected int
 	}{
 		{
-			name:  "leaf change reaches transitive importers and test-only importers",
-			seeds: []string{mod + "/leaf"},
+			name:   "code change reaches transitive and test-only importers",
+			expand: set(mod + "/leaf"),
 			// notest is affected but contributes no tests to run
 			want:     []string{mod + "/leaf", mod + "/mid", mod + "/top", mod + "/viatest"},
 			affected: 5,
 		},
 		{
 			name:     "mid change does not reach leaf downwards",
-			seeds:    []string{mod + "/mid"},
+			expand:   set(mod + "/mid"),
 			want:     []string{mod + "/mid", mod + "/top"},
 			affected: 2,
 		},
 		{
-			name:     "leaf package with no internal importers selects only itself",
-			seeds:    []string{mod + "/lonely"},
+			name:     "package with no internal importers selects only itself",
+			expand:   set(mod + "/lonely"),
 			want:     []string{mod + "/lonely"},
 			affected: 1,
 		},
 		{
 			name:     "changing an untested package still runs its importers",
-			seeds:    []string{mod + "/notest"},
+			expand:   set(mod + "/notest"),
 			want:     []string{mod + "/top"},
 			affected: 2,
 		},
 		{
-			name:     "no changes selects nothing",
-			seeds:    nil,
+			name:     "test-only change selects just that package, no importers",
+			testOnly: set(mod + "/leaf"),
+			want:     []string{mod + "/leaf"},
+			affected: 1,
+		},
+		{
+			name:     "nothing changed selects nothing",
 			want:     []string{},
 			affected: 0,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			seeds := make(map[string]bool, len(tt.seeds))
-			for _, s := range tt.seeds {
-				seeds[s] = true
-			}
-			got, affected := selectTests(fixture(), mod, seeds)
+			got, affected := selectTests(fixture(), mod, tt.expand, tt.testOnly)
 			assert.Equal(t, tt.want, got)
 			assert.Equal(t, tt.affected, affected)
 		})
@@ -78,8 +89,112 @@ func TestSelectTests(t *testing.T) {
 }
 
 func TestSelectTestsIgnoresExternalImports(t *testing.T) {
-	// a change to an external dependency is not expressible as a seed, but
-	// external imports must never end up in the reverse graph
-	_, affected := selectTests(fixture(), mod, map[string]bool{"k8s.io/apimachinery/pkg/runtime": true})
+	// an external package must never end up in the reverse graph
+	_, affected := selectTests(fixture(), mod, set("k8s.io/apimachinery/pkg/runtime"), nil)
 	assert.Equal(t, 1, affected, "external package should reach nothing internal")
+}
+
+func TestClassify(t *testing.T) {
+	// index modelled on real kyverno cases: an embedding package, a package
+	// with a testdata fixture, and a test-embed.
+	idx := fileIndex{
+		dirToPkg: map[string]string{
+			"pkg/engine/resources": mod + "/pkg/engine/resources",
+			"pkg/engine/mutate":    mod + "/pkg/engine/mutate",
+			"pkg/policy/common":    mod + "/pkg/policy/common",
+		},
+		embed: map[string]embedRef{
+			"pkg/engine/resources/default-config.yaml": {mod + "/pkg/engine/resources", false},
+			"pkg/engine/mutate/testfix.yaml":           {mod + "/pkg/engine/mutate", true},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		changed       []string
+		wantExpand    []string
+		wantTestOnly  []string
+		wantSelectAll bool
+		wantUnmapped  []string
+		wantIgnored   int
+	}{
+		{
+			name:       "ordinary code file expands",
+			changed:    []string{"pkg/policy/common/validate_pattern.go"},
+			wantExpand: []string{mod + "/pkg/policy/common"},
+		},
+		{
+			name:         "test file is test-only",
+			changed:      []string{"pkg/policy/common/validate_pattern_test.go"},
+			wantTestOnly: []string{mod + "/pkg/policy/common"},
+		},
+		{
+			name:       "code plus test change in one package expands (not test-only)",
+			changed:    []string{"pkg/policy/common/validate_pattern.go", "pkg/policy/common/validate_pattern_test.go"},
+			wantExpand: []string{mod + "/pkg/policy/common"},
+		},
+		{
+			name:       "embedded input is treated as a code change to its package",
+			changed:    []string{"pkg/engine/resources/default-config.yaml"},
+			wantExpand: []string{mod + "/pkg/engine/resources"},
+		},
+		{
+			name:         "test-embedded input is test-only",
+			changed:      []string{"pkg/engine/mutate/testfix.yaml"},
+			wantTestOnly: []string{mod + "/pkg/engine/mutate"},
+		},
+		{
+			name:         "testdata fixture is test-only for its owning package",
+			changed:      []string{"pkg/engine/mutate/testdata/endpoints.yaml"},
+			wantTestOnly: []string{mod + "/pkg/engine/mutate"},
+		},
+		{
+			name:          "go.mod forces select-all",
+			changed:       []string{"go.mod"},
+			wantSelectAll: true,
+		},
+		{
+			name:          "go.sum forces select-all",
+			changed:       []string{"go.sum"},
+			wantSelectAll: true,
+		},
+		{
+			name:         "go file under no known package is unmapped",
+			changed:      []string{"hack/controller-gen/main.go"},
+			wantUnmapped: []string{"hack/controller-gen/main.go"},
+		},
+		{
+			name:        "unembedded, non-test data file is ignored",
+			changed:     []string{"README.md", ".github/workflows/ci.yaml"},
+			wantIgnored: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := classify(tt.changed, idx)
+			assert.Equal(t, sortedKeys(c.expand), sortStrings(tt.wantExpand))
+			assert.Equal(t, sortedKeys(c.testOnly), sortStrings(tt.wantTestOnly))
+			assert.Equal(t, tt.wantSelectAll, c.selectAll)
+			assert.Equal(t, sortStrings(tt.wantUnmapped), sortStrings(c.unmapped))
+			assert.Equal(t, tt.wantIgnored, c.ignored)
+		})
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortStrings(xs []string) []string {
+	out := append([]string(nil), xs...)
+	sort.Strings(out)
+	if out == nil {
+		return []string{}
+	}
+	return out
 }

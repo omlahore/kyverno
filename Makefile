@@ -873,6 +873,14 @@ test-unit:
 	@echo Running unit tests... >&2
 	@go test -v -race -covermode atomic -coverprofile $(CODE_COVERAGE_FILE_OUT) ./...
 
+TEST_SELECT_BASE ?= origin/main
+
+.PHONY: test-selected
+test-selected: ## Run only the unit tests that can observe changes since TEST_SELECT_BASE
+test-selected:
+	@pkgs=$$(git diff --name-only $(TEST_SELECT_BASE)... | go run ./hack/testselect -pattern -explain); \
+	if [ -z "$$pkgs" ]; then echo "No test packages affected." >&2; else go test $$pkgs; fi
+
 #############
 # CLI TESTS #
 #############
